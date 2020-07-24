@@ -5879,14 +5879,25 @@ CONFIG_EXOFS_FS=m
 ##
 ## file: fs/ext2/Kconfig
 ##
-# CONFIG_EXT2_FS is not set
+CONFIG_EXT2_FS=m
+# CONFIG_EXT2_FS_XATTR is not set
+# CONFIG_EXT2_FS_POSIX_ACL is not set
+# CONFIG_EXT2_FS_SECURITY is not set
+
+##
+## file: fs/ext2fyp/Kconfig
+##
+CONFIG_EXT2FYP_FS=m
+# CONFIG_EXT2FYP_FS_XATR is not set
+# CONFIG_EXT2FYP_FS_POSIX_ACL is not set
+# CONFIG_EXT2FYP_FS_SECURITY is not set
 
 ##
 ## file: fs/ext4/Kconfig
 ##
 # CONFIG_EXT3_FS is not set
 CONFIG_EXT4_FS=m
-CONFIG_EXT4_USE_FOR_EXT2=y
+# CONFIG_EXT4_USE_FOR_EXT2 is not set
 CONFIG_EXT4_FS_POSIX_ACL=y
 CONFIG_EXT4_FS_SECURITY=y
 CONFIG_EXT4_ENCRYPTION=y
