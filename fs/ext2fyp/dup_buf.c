@@ -27,7 +27,7 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 		if (bh == NULL) {
 			while (i--)
 				brelse(dbuf->bhs[i]);
-			goto errout;
+			goto enomem;
 		}
 		dbuf->bhs[i] = bh;
 		dbuf->blocknrs[i] = data_blocknrs[i];
@@ -41,6 +41,13 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 			dbuf->main_data_block = i;
 			break;
 		}
+		/* re-lock the buffer if it fails */
+		lock_buffer(dbuf->bhs[i]);
+	}
+	if (i == nr_data_blocks) {
+		while (i--)
+			unlock_buffer(dbuf->bhs[i]);
+		goto out;
 	}
 
 	for (i = 0; i < dbuf->main_data_block; i++) {
@@ -58,10 +65,11 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 		unlock_buffer(dbuf->bhs[i]);
 	}
 
+out:
 	dbuf->data = dbuf->bhs[dbuf->main_data_block]->b_data;
 	dbuf->size = sb->s_blocksize;
 	return dbuf;
-errout:
+enomem:
 	kmem_cache_free(dup_buf_kmem, dbuf);
 	return NULL;
 }
