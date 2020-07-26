@@ -71,18 +71,18 @@ static inline void ext2_bmpt_rec_clear(struct ext2_bmptrec *rec)
 	rec->b_flags = 0;
 }
 
-static inline uint32_t ext2_bmpt_ag_start_bg(struct super_block *sb, int alt)
+static inline uint32_t ext2_bmpt_ag_start_bg(struct super_block *sb,
+					     unsigned long inode_bg, int alt)
 {
-	uint32_t nags;
-
-	nags = EXT2_SB(sb)->s_groups_count / EXT2_BMPT_N_DUPS;
-	return nags * alt;
+	return ((inode_bg + alt) % EXT2_SB(sb)->s_groups_count);
 }
 
 static inline ext2_fsblk_t ext2_bmpt_ag_start_fsblk(struct super_block *sb,
+						    unsigned long inode_bg,
 						    int alt)
 {
-	return ext2_group_first_block_no(sb, ext2_bmpt_ag_start_bg(sb, alt));
+	return ext2_group_first_block_no(sb, ext2_bmpt_ag_start_bg(sb, inode_bg,
+								   alt));
 }
 
 static inline struct ext2_bmpthdr *ext2_bmpt_run(struct inode *inode, int run)
@@ -176,7 +176,9 @@ static ext2_fsblk_t ext2_bmpt_find_near(struct ext2_bmpt_path *path,
 		bg_start = ext2_group_first_block_no(
 			path->inode->i_sb, EXT2_I(path->inode)->i_block_group);
 	else
-		bg_start = ext2_bmpt_ag_start_fsblk(path->inode->i_sb, alt);
+		bg_start = ext2_bmpt_ag_start_fsblk(
+			path->inode->i_sb, EXT2_I(path->inode)->i_block_group,
+			alt);
 	colour = (current->pid % 16) *
 		 (EXT2_BLOCKS_PER_GROUP(path->inode->i_sb) / 16);
 	return bg_start + colour;
@@ -197,7 +199,10 @@ static inline ext2_fsblk_t ext2_bmpt_find_goal(struct ext2_bmpt_path *path,
 	 */
 	if (block_i && (iblk == block_i->last_alloc_logical_block + 1) &&
 	    (block_i->last_alloc_physical_block != 0)) {
-		return block_i->last_alloc_physical_block + 1;
+		unsigned long long block =
+			block_i->last_alloc_physical_block + 1;
+		block += alt * EXT2_SB(path->inode->i_sb)->s_blocks_per_group;
+		return (ext2_fsblk_t)block;
 	}
 
 	return ext2_bmpt_find_near(path, dbuf, pos, alt);
@@ -845,11 +850,15 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	if (nblks_allocate) {
 		int i;
 		struct ext2_bmptirec goal;
+		ssize_t pos = (null_depth) ? path.p[null_depth - 1] : 0;
 
 		ext2_bmpt_irec_clear(&goal);
 		for (i = 0; i < EXT2_BMPT_N_DUPS; i++) {
-			goal.b_blocks[i] = ext2_bmpt_find_goal(&path, map->iblk,
-							       NULL, 0, i);
+			goal.b_blocks[i] = ext2_bmpt_find_goal(
+				&path, map->iblk,
+				(null_depth) ? path.dbufs[null_depth - 1] :
+					       NULL,
+				pos, i);
 		}
 
 		ret = ext2_bmpt_alloc_dupblocks(
@@ -888,8 +897,10 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 
 	if (!(path.ihdr.h_flags & EXT2_BMPT_HDR_FLAGS_DUP)) {
 		ext2_fsblk_t goal;
+		ssize_t pos = path.p[l0depth];
 
-		goal = ext2_bmpt_find_goal(&path, map->iblk, NULL, 0, 0);
+		goal = ext2_bmpt_find_goal(&path, map->iblk,
+					   path.dbufs[l0depth], pos, 0);
 		numblks = ext2_bmpt_blks_to_allocate(&path, path.dbufs[l0depth],
 						     map->iblk, numblks);
 		ret = ext2_bmpt_alloc_blocks(&path, goal, &dbirec, &numblks);
@@ -898,11 +909,12 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	} else {
 		int i;
 		struct ext2_bmptirec goal;
+		ssize_t pos = path.p[l0depth];
 		ext2_bmpt_irec_clear(&goal);
 
 		for (i = 0; i < sbi->s_dupinode_dup_cnt; i++) {
-			goal.b_blocks[i] = ext2_bmpt_find_goal(&path, map->iblk,
-							       NULL, 0, i);
+			goal.b_blocks[i] = ext2_bmpt_find_goal(
+				&path, map->iblk, path.dbufs[l0depth], pos, i);
 		}
 
 		ret = ext2_bmpt_alloc_dupblocks(&path, &goal, &dbirec,
