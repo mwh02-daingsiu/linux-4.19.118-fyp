@@ -274,8 +274,7 @@ static int ext2_submit_fraction(int op, int op_flags, struct dup_mapping *map,
 	struct bio *bios[MAX_BUF_PER_PAGE];
 	int j;
 
-	for (j = 0; j < map->nr_dups; j++)
-		atomic_set(&map->fractions[block_inc].nr_ioerr, 0);
+	atomic_set(&map->fractions[block_inc].nr_ioerr, 0);
 
 	atomic_set(&map->fractions[block_inc].nr_ongoing_io, map->nr_dups);
 
@@ -521,7 +520,7 @@ int ext2_block_read_full_page(struct page *page)
 						args.irec.b_blocks[j];
 				}
 				set_bit(i, map->mapped);
-				nr++;
+				nr += map->nr_dups;
 			} else {
 				zero_user(page, i * blocksize, blocksize);
 				if (!err)
