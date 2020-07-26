@@ -27,6 +27,7 @@ struct dup_mapping {
 	DECLARE_BITMAP(dirty, MAX_BUF_PER_PAGE);
 	DECLARE_BITMAP(mapped, MAX_BUF_PER_PAGE);
 	DECLARE_BITMAP(uptodate, MAX_BUF_PER_PAGE);
+	DECLARE_BITMAP(new, MAX_BUF_PER_PAGE);
 	unsigned int blocksize;
 	unsigned int nr_dups;
 	atomic_t ongoing;
@@ -61,8 +62,9 @@ static struct dup_mapping *create_page_dup_mapping(struct page *page,
 		struct dup_mapping *map;
 		int j;
 
-		map = (struct dup_mapping *)kmem_cache_zalloc(dup_mapping_kmem,
-							      GFP_NOFS);
+		map = (struct dup_mapping *)kmem_cache_alloc(dup_mapping_kmem,
+							     GFP_NOFS);
+		memset(map, 0, sizeof(*map));
 		for (j = 0; j < ARRAY_SIZE(map->fractions); j++) {
 			map->fractions[j].map = map;
 		}
@@ -596,6 +598,43 @@ int ext2_block_write_full_page(struct page *page, struct writeback_control *wbc)
 	return __ext2_block_write_full_page(inode, page, wbc);
 }
 
+static void ext2_page_zero_new_fraction(struct page *page, unsigned from, unsigned to)
+{
+	unsigned int block_start, block_end;
+	unsigned int blocksize, bbits;
+	struct dup_mapping *map;
+	unsigned int i = 0;
+
+	BUG_ON(!PageLocked(page));
+	if (!page_has_dup_mapping(page))
+		return;
+
+	map = page_dup_mapping(page);
+	blocksize = map->blocksize;
+	bbits = block_size_bits(blocksize);
+
+	for (block_start = 0; block_start < PAGE_SIZE;
+	     i++, block_start = block_end) {
+		block_end = block_start + blocksize;
+		if (test_bit(i, map->new)) {
+			if (block_end > from && block_start < to) {
+				if (!PageUptodate(page)) {
+					unsigned start, size;
+
+					start = max(from, block_start);
+					size = min(to, block_end) - start;
+
+					zero_user(page, start, size);
+					set_bit(i, map->uptodate);
+				}
+
+				clear_bit(i, map->new);
+				ext2_mark_dup_mapping_dirty(map, i);
+			}
+		}
+	}
+}
+
 int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 {
 	unsigned int from = pos & (PAGE_SIZE - 1);
@@ -604,7 +643,7 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 	unsigned int block_start, block_end;
 	sector_t block;
 	int err = 0, i = 0;
-	unsigned blocksize, bbits;
+	unsigned int blocksize, bbits;
 	struct dup_mapping *map;
 	struct map_io_entry *ios[MAX_BUF_PER_PAGE];
 	int nr_wait = 0;
@@ -632,6 +671,7 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 			continue;
 		}
 
+		clear_bit(i, map->new);
 		if (!test_bit(i, map->mapped)) {
 			struct ext2_bmpt_map_args args;
 
@@ -644,10 +684,12 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 			if (err)
 				break;
 
+			set_bit(i, map->new);
 			if (args.flags & EXT2_BMPT_MAP_NEW) {
 				clean_bdev_aliases(map->bdev, block + i, 1);
 				if (PageUptodate(page)) {
 					set_bit(i, map->uptodate);
+					clear_bit(i, map->new);
 					ext2_mark_dup_mapping_dirty(map, i);
 					continue;
 				}
@@ -693,7 +735,7 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 	}
 
 	if (unlikely(err))
-		page_zero_new_buffers(page, from, to);
+		ext2_page_zero_new_fraction(page, from, to);
 	return err;
 }
 
@@ -708,6 +750,7 @@ static int __ext2_block_commit_write(struct inode *inode, struct page *page,
 	int partial = 0;
 	unsigned int blocksize, bbits;
 	unsigned int block_start, block_end;
+	unsigned int i = 0;
 	struct dup_mapping *map;
 
 	map = page_dup_mapping(page);
@@ -716,8 +759,8 @@ static int __ext2_block_commit_write(struct inode *inode, struct page *page,
 
 	block_start = 0;
 
-	do {
-		unsigned int i = block_start >> (PAGE_SIZE - bbits);
+	for (block_start = 0; block_start < PAGE_SIZE;
+	     i++, block_start = block_end) {
 		block_end = block_start + blocksize;
 		if (block_end <= from || block_start >= to) {
 			if (!test_bit(i, map->uptodate))
@@ -726,9 +769,8 @@ static int __ext2_block_commit_write(struct inode *inode, struct page *page,
 			set_bit(i, map->uptodate);
 			ext2_mark_dup_mapping_dirty(map, i);
 		}
-
-		block_start = block_end;
-	} while (block_start < PAGE_SIZE);
+		clear_bit(i, map->new);
+	}
 
 	/*
 	 * If this is a partial write which happened to make all buffers
@@ -794,7 +836,7 @@ int ext2_block_write_end(struct file *file, struct address_space *mapping,
 		if (!PageUptodate(page))
 			copied = 0;
 
-		page_zero_new_buffers(page, start + copied, start + len);
+		ext2_page_zero_new_fraction(page, start + copied, start + len);
 	}
 	flush_dcache_page(page);
 
