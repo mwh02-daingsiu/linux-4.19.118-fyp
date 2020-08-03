@@ -763,6 +763,7 @@ static int ext2_get_blocks(struct inode *inode, sector_t iblock,
 	struct ext2_inode_info *ei = EXT2_I(inode);
 
 	if (ei->i_flags & EXT2_FYP_BMPT_FL) {
+		/* For I-node with BMPT tree, we use bmpt bmap routines instead */
 		struct ext2_bmpt_map_args args;
 		int flags = 0;
 
@@ -941,6 +942,7 @@ const struct address_space_operations ext2_aops = {
 	.error_remove_page	= generic_error_remove_page,
 };
 
+/* This address space operation is for I-node with EXT2_FYP_DUP_RUN_FL flag on */
 const struct address_space_operations ext2_dup_aops = {
 	.readpage = ext2_dup_readpage,
 	.writepage = ext2_dup_writepage,
@@ -1303,6 +1305,8 @@ static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
 		ndups = EXT2_FYP_ITB_N_DUPS;
 	blocks[0] = le32_to_cpu(gdp->bg_inode_table) +
 		    (offset >> EXT2_BLOCK_SIZE_BITS(sb));
+	/* If the file system is EXT2FYP, we read backup inode tables as well when
+	 * we failed to read the main inode table block */
 	for (i = 1; i < ndups; i++)
 		blocks[i] = le32_to_cpu(gdp->bg_fyp.bg_dup_inode_table[i - 1]) +
 			    (offset >> EXT2_BLOCK_SIZE_BITS(sb));

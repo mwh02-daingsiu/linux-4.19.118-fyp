@@ -17,21 +17,37 @@
 #include <linux/writeback.h>
 #include "ext2.h"
 
+/* A dup mapping structure corresponds to one page cache page */
 struct dup_mapping {
+	/* Sub-fractions of a page. There would be more than one fraction
+	 * if the block size of the file system is smaller than the page size
+	 * of the architecture. */
 	struct map_io_entry {
 		sector_t blocks[3];
+		/* Number of EIOs for this fraction */
 		atomic_t nr_ioerr;
+		/* Number of on-going IOs for this fraction */
 		atomic_t nr_ongoing_io;
+		/* Points to this dup_mapping structure */
 		struct dup_mapping *map;
 	} fractions[MAX_BUF_PER_PAGE];
+	/* Dirty fractions in this page */
 	DECLARE_BITMAP(dirty, MAX_BUF_PER_PAGE);
+	/* Mapped fractions (having corresponding bmap mappings in this page) */
 	DECLARE_BITMAP(mapped, MAX_BUF_PER_PAGE);
+	/* Uptodate fractions (content not stale) */
 	DECLARE_BITMAP(uptodate, MAX_BUF_PER_PAGE);
+	/* New-allocated fractions */
 	DECLARE_BITMAP(new, MAX_BUF_PER_PAGE);
+	/* File system block size */
 	unsigned int blocksize;
+	/* Number of duplicates for this page */
 	unsigned int nr_dups;
+	/* Number of on-going IOs */
 	atomic_t ongoing;
+	/* The corresponding page cache page */
 	struct page *page;
+	/* The corresponding block device the FS resides on */
 	struct block_device *bdev;
 };
 
@@ -59,6 +75,7 @@ static struct dup_mapping *create_page_dup_mapping(struct page *page,
 	struct ext2_inode_info *ei = EXT2_I(inode);
 
 	if (!page_has_dup_mapping(page)) {
+		/* Create dup_mapping if the page didn't have one */
 		struct dup_mapping *map;
 		int j;
 
@@ -75,6 +92,7 @@ static struct dup_mapping *create_page_dup_mapping(struct page *page,
 			map->nr_dups = 1;
 		map->page = page;
 		map->bdev = inode->i_sb->s_bdev;
+		/* Attach the newly-allocated dup_mapping to the page */
 		attach_page_dup_mapping(page, map);
 	}
 	return page_dup_mapping(page);
@@ -123,6 +141,7 @@ static inline int block_size_bits(unsigned int blocksize)
 	return ilog2(blocksize);
 }
 
+/* This is our common BIO IO end callback */
 static void end_bio_common(struct bio *bio)
 {
 	struct map_io_entry *io_entry = bio->bi_private;
@@ -131,6 +150,7 @@ static void end_bio_common(struct bio *bio)
 	if (status)
 		atomic_inc(&io_entry->nr_ioerr);
 	BUG_ON(atomic_read(&io_entry->nr_ongoing_io) <= 0);
+	/* Wake up any potential waiters if all IO finishes */
 	if (atomic_dec_and_test(&io_entry->nr_ongoing_io))
 		wake_up_var(&io_entry->nr_ongoing_io);
 }
@@ -141,6 +161,8 @@ static void end_bio_after_all_write(struct dup_mapping *map)
 	int i;
 
 	for (i = 0; i < MAX_BUF_PER_PAGE; i++) {
+		/* If all write to duplications fails, clear the up-to-date bit of the fraction and set the page error.
+		 * Otherwise, set the fraction up-to-date */
 		if (atomic_read(&map->fractions[i].nr_ioerr) == map->nr_dups) {
 			clear_bit(i, map->uptodate);
 			SetPageError(map->page);
@@ -149,6 +171,7 @@ static void end_bio_after_all_write(struct dup_mapping *map)
 		}
 	}
 
+	/* The page is no longer under writeback */
 	end_page_writeback(page);
 }
 
@@ -158,11 +181,13 @@ static void end_bio_wr_io_sync(struct bio *bio)
 	struct dup_mapping *map = io_entry->map;
 	bool wrback_finish;
 
+	/* Common BIO END IO callback */
 	end_bio_common(bio);
 	wrback_finish = atomic_dec_and_test(&map->ongoing);
 	if (!wrback_finish)
 		return;
 
+	/* All IO on the dup_mapping finishes */
 	end_bio_after_all_write(map);
 }
 
@@ -172,6 +197,8 @@ static void end_bio_after_all_read(struct dup_mapping *map)
 	int i;
 
 	for (i = 0; i < MAX_BUF_PER_PAGE; i++) {
+		/* If all read to duplications fails, clear the up-to-date bit of the fraction and set the page error.
+		 * Otherwise, set the fraction up-to-date */
 		if (atomic_read(&map->fractions[i].nr_ioerr) == map->nr_dups) {
 			clear_bit(i, map->uptodate);
 			SetPageError(map->page);
@@ -180,6 +207,7 @@ static void end_bio_after_all_read(struct dup_mapping *map)
 		}
 	}
 
+	/* If all fractions are okay, set the page up-to-date as well */
 	if (!PageError(page))
 		SetPageUptodate(page);
 	unlock_page(page);
@@ -191,11 +219,13 @@ static void end_bio_rd_io_sync(struct bio *bio)
 	struct dup_mapping *map = io_entry->map;
 	bool wrback_finish;
 
+	/* Common BIO END IO callback */
 	end_bio_common(bio);
 	wrback_finish = atomic_dec_and_test(&map->ongoing);
 	if (!wrback_finish)
 		return;
 
+	/* All IO on the dup_mapping finishes */
 	end_bio_after_all_read(map);
 }
 
@@ -273,6 +303,8 @@ static int ext2_submit_fraction(int op, int op_flags, struct dup_mapping *map,
 {
 	struct bio *bios[MAX_BUF_PER_PAGE];
 	int j;
+
+	/* We are going to submit the fraction, and send each duplication to the media */
 
 	atomic_set(&map->fractions[block_inc].nr_ioerr, 0);
 
@@ -364,6 +396,7 @@ int __ext2_block_write_full_page(struct inode *inode, struct page *page,
 	last_block = (i_size_read(inode) - 1) >> bbits;
 
 	for (i = 0; i < PAGE_SIZE / blocksize; i++) {
+		/* For any fractions outside the EOF, we clear the dirty bit */
 		if (start_block + i > last_block) {
 			clear_bit(i, map->dirty);
 		}
@@ -383,6 +416,7 @@ int __ext2_block_write_full_page(struct inode *inode, struct page *page,
 			set_bit(i, map->uptodate);
 		} else if (!test_bit(i, map->mapped) &&
 			   test_bit(i, map->dirty)) {
+			/* Bring in bmap mappings if the fraction isn't mapped. We also do allocations here */
 			struct ext2_bmpt_map_args args;
 			int j;
 			args.iblk = start_block + i;
@@ -413,7 +447,9 @@ int __ext2_block_write_full_page(struct inode *inode, struct page *page,
 		}
 	}
 
+	/* Count the on-going IOs.*/
 	for (i = 0; i < PAGE_SIZE / blocksize; i++) {
+		/* Holes and non-dirty fractions won't count */
 		if (test_bit(i, map->mapped) && test_bit(i, map->dirty))
 			atomic_add(map->nr_dups, &map->ongoing);
 	}
@@ -430,6 +466,7 @@ int __ext2_block_write_full_page(struct inode *inode, struct page *page,
 		if (!test_bit(i, map->mapped))
 			continue;
 		if (test_and_clear_bit(i, map->dirty)) {
+			/* Submit the dirty and non-hole fraction to the media */
 			ext2_submit_fraction(REQ_OP_WRITE, write_flags, map, i,
 					     inode->i_write_hint, wbc,
 					     end_bio_wr_io_sync);
@@ -492,14 +529,17 @@ int ext2_block_read_full_page(struct page *page)
 	blocksize = map->blocksize;
 	bbits = block_size_bits(blocksize);
 
+	/* I-node data block */
 	iblock = (sector_t)page->index << (PAGE_SHIFT - bbits);
 	lblock = (i_size_read(inode) + blocksize - 1) >> bbits;
 	nr = 0;
 
 	for (i = 0; i < PAGE_SIZE / blocksize; i++) {
+		/* No need to read fractions that are already up-to-date */
 		if (test_bit(i, map->uptodate))
 			continue;
 
+		/* If the fraction isn't mapped yet, get its mapping */
 		if (!test_bit(i, map->mapped)) {
 			struct ext2_bmpt_map_args args;
 			int j, err;
@@ -522,7 +562,9 @@ int ext2_block_read_full_page(struct page *page)
 				set_bit(i, map->mapped);
 				nr += map->nr_dups;
 			} else {
+				/* If it is a hole, or mapping error is encountered, zero the fraction */
 				zero_user(page, i * blocksize, blocksize);
+				/* And if it is a hole instead of mapping error encountered, set the fraction up-to-date */
 				if (!err)
 					set_bit(i, map->uptodate);
 				continue;
@@ -551,6 +593,7 @@ int ext2_block_read_full_page(struct page *page)
 	 * the underlying blockdev brought it uptodate (the sct fix).
 	 */
 	for (i = 0; i < PAGE_SIZE / blocksize; i++) {
+		/* Already up-to-date mappings need not to be read again */
 		if (test_bit(i, map->uptodate))
 			continue;
 		ext2_submit_fraction(REQ_OP_READ, 0, map, i, 0, NULL,
@@ -609,6 +652,7 @@ static void ext2_page_zero_new_fraction(struct page *page, unsigned from, unsign
 		return;
 
 	map = page_dup_mapping(page);
+	/* FS Block size */
 	blocksize = map->blocksize;
 	bbits = block_size_bits(blocksize);
 
@@ -616,6 +660,7 @@ static void ext2_page_zero_new_fraction(struct page *page, unsigned from, unsign
 	     i++, block_start = block_end) {
 		block_end = block_start + blocksize;
 		if (test_bit(i, map->new)) {
+			/* For any newly-allocated FS blocks, zero the corresponding fraction if it is in the range of [from, to) */
 			if (block_end > from && block_start < to) {
 				if (!PageUptodate(page)) {
 					unsigned start, size;
@@ -627,6 +672,7 @@ static void ext2_page_zero_new_fraction(struct page *page, unsigned from, unsign
 					set_bit(i, map->uptodate);
 				}
 
+				/* Clear the new flag of the fraction, and mark the fraction dirty */
 				clear_bit(i, map->new);
 				ext2_mark_dup_mapping_dirty(map, i);
 			}
@@ -656,6 +702,7 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 	blocksize = map->blocksize;
 	bbits = block_size_bits(blocksize);
 
+	/* I-node data block */
 	block = (sector_t)page->index << (PAGE_SHIFT - bbits);
 
 	for (block_start = 0; block_start < PAGE_SIZE;
@@ -663,6 +710,7 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 		block_end = block_start + blocksize;
 
 		if (block_end <= from || block_start >= to) {
+			/* For any out-of-range [from, to) fractions, always set them up-to-date */
 			if (PageUptodate(page)) {
 				if (!test_bit(i, map->uptodate))
 					set_bit(i, map->uptodate);
@@ -670,8 +718,10 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 			continue;
 		}
 
+		/* Clear the new flag of the fraction */
 		clear_bit(i, map->new);
 		if (!test_bit(i, map->mapped)) {
+			/* Bring in the bmap mapping if the fraction isn't mapped yet. We also do allocations here */
 			struct ext2_bmpt_map_args args;
 
 			args.iblk = block + i;
@@ -715,6 +765,8 @@ int __ext2_block_write_begin_int(struct page *page, loff_t pos, unsigned len)
 		}
 		if (!test_bit(i, map->uptodate) &&
 		    (block_start < from || block_end > to)) {
+			/* For any blocks that require Read-modify-write pattern, such as unaligned write,
+			 * read the content from media first */
 			ext2_submit_fraction(REQ_OP_READ, 0, map, i, 0, NULL,
 					     end_bio_common);
 			ios[nr_wait++] = &map->fractions[i];
@@ -884,6 +936,7 @@ int ext2_generic_write_end(struct file *file, struct address_space *mapping,
 	return copied;
 }
 
+/* Set all fractions plus the corresponding page cache page dirty */
 static int __set_page_dirty_dup_mapping(struct page *page)
 {
 	struct address_space *mapping = page_mapping(page);
@@ -903,12 +956,15 @@ static int __set_page_dirty_dup_mapping(struct page *page)
 		struct dup_mapping *map = page_dup_mapping(page);
 		unsigned int blocksize = map->blocksize;
 
+		/* All fraction have their dirty bits dirty */
 		for (i = 0; i < PAGE_SIZE / blocksize; i++)
 			set_bit(i, map->dirty);
+		/* Tag the radix tree/XARRAY of the page cache page dirty as well */
 		__set_page_dirty(page, mapping, 0);
 	}
 	unlock_page_memcg(page);
 
+	/* We also need to mark the page's owning I-node dirty if the page changes from non-dirty to dirty */
 	if (newly_dirty)
 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
 	return newly_dirty;
@@ -921,6 +977,7 @@ int ext2_set_page_dirty(struct page *page)
 	return __set_page_dirty_dup_mapping(page);
 }
 
+/* Invalidate some fractions, or the whole page */
 void ext2_invalidatepage(struct page *page, unsigned int offset,
 			 unsigned int len)
 {
@@ -929,7 +986,9 @@ void ext2_invalidatepage(struct page *page, unsigned int offset,
 		return;
 
 	if (offset == 0 && len == PAGE_SIZE) {
+		/* The whole page is invalidated */
 		cancel_dirty_page(page);
+		/* Release its dup_mapping as well */
 		try_to_release_dup_mapping(page);
 	} else {
 		struct dup_mapping *map = page_dup_mapping(page);
@@ -957,24 +1016,34 @@ int ext2_truncate_page(struct address_space *mapping, loff_t from)
 	struct dup_mapping *map;
 	struct page *page;
 
+	/* FS blocksize */
 	blocksize = i_blocksize(inode);
+	/* FS blocksize shifts */
 	bbits = inode->i_blkbits;
+	/* The FS block of the starting offset within page */
 	i = offset >> bbits;
+	/* The starting offset within an FS block (will be different than @offset if FS blocksize < page size */
 	length = offset & (blocksize - 1);
 
 	/* Do nothing if from is aligned to block boundary */
 	if (!length)
 		return 0;
 
+	/* We need to Read-modify-write an FS block within a page if the starting offset is not aligned to FS block */
+
+	/* The length to be operated */
 	length = blocksize - length;
+	/* The I-node data block number */
 	iblock = ((sector_t)index << (PAGE_SHIFT - bbits)) + i;
 
+	/* Get the corresponding page cache page, or if we don't have, create one */
 	page = grab_cache_page(mapping, index);
 	if (!page) {
 		err = -ENOMEM;
 		goto out;
 	}
 
+	/* Create the dup_mapping, if the page doesn't have one */
 	map = create_page_dup_mapping(page, inode);
 	if (!test_bit(i, map->mapped)) {
 		struct ext2_bmpt_map_args args;
@@ -982,6 +1051,7 @@ int ext2_truncate_page(struct address_space *mapping, loff_t from)
 
 		WARN_ON(map->blocksize != blocksize);
 
+		/* Bring in the bmap mapping if possible */
 		args.iblk = iblock + i;
 		args.flags = 0;
 		args.len = 1;
@@ -999,21 +1069,27 @@ int ext2_truncate_page(struct address_space *mapping, loff_t from)
 		set_bit(i, map->mapped);
 	}
 
+	/* If the page content is already up to date, set the starting fraction not aligned to the FS block up to data as well */
 	if (PageUptodate(page))
 		set_bit(i, map->uptodate);
 
+	/* If the content within the fraction is not uptodate, read in the FS block */
 	if (!test_bit(i, map->uptodate)) {
 		ext2_submit_fraction(REQ_OP_READ, 0, map, i, 0, NULL,
 				     end_bio_common);
 		wait_ongoing_io(map, i);
 		if (atomic_read(&map->fractions[i].nr_ioerr) == map->nr_dups) {
+			/* If all IO on the FS blocks duplications fails, we bail out */
 			err = -EIO;
 			goto unlock;
 		}
+		/* Set the fraction up-to-date */
 		set_bit(i, map->uptodate);
 	}
 
+	/* Fill the offset starting from @from with zero */
 	zero_user(page, offset, length);
+	/* Mark the fraction to be dirty */
 	ext2_mark_dup_mapping_dirty(map, i);
 	err = 0;
 
@@ -1032,6 +1108,11 @@ int ext2_releasepage(struct page *page, gfp_t gfp_mask)
 	return 1;
 }
 
+/*
+ * Check if the page contains any non up-to-date fractions.
+ * Return 1 if the page is fully up-to-date (i.e. all fractions are uptodate).
+ * Return 0 if the page isn't fully up-to-date (i.e. some or all fractions are not up-to-date)
+ */
 int ext2_is_partially_uptodate(struct page *page, unsigned long from,
 			       unsigned long count)
 {

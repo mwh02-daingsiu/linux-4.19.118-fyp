@@ -603,6 +603,7 @@ got:
 		/* set bmpt flag only for directory, file and normal symlink*/
 		if (S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode)) {
 			ei->i_flags |= EXT2_FYP_BMPT_FL;
+			/* For EXT2_FYP_DUP_RUN_FL-enabled I-nodes, we enable dup-enabled BMPT tree as well */
 			if (S_ISDIR(mode) || S_ISLNK(mode))
 				ei->i_flags |= EXT2_FYP_DUP_RUN_FL;
 			ext2_bmpt_init_inode(inode,

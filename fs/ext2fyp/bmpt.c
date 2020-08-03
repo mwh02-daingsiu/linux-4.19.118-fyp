@@ -5,11 +5,15 @@
 #include <linux/uio.h>
 #include "ext2.h"
 
+/*
+ * A BMPT path context describing the process of BMPT tree operations
+ */
 struct ext2_bmpt_path {
 	struct inode *inode;
 	struct ext2_bmpthdr *hdr;
 	struct ext2_bmptihdr ihdr;
 
+	/* For everything below, [0] is highest level */
 	struct dup_buf *dbufs[EXT2_BMPT_MAXLEVELS];
 	struct ext2_bmptrec *recs[EXT2_BMPT_MAXLEVELS];
 	int p[EXT2_BMPT_MAXLEVELS];
@@ -274,6 +278,7 @@ struct dup_buf *ext2_bmpt_dbuf_get(struct super_block *sb,
 	return dup_buf_get(sb, pblks, j, main_data_block);
 }
 
+/* This routine fill a BMPT path from the depth specified till the leaf */
 static int ext2_bmpt_get_path(struct ext2_bmpt_path *path, ext2_lblk_t iblk,
 			      int from_depth, int *null_depth)
 {
@@ -307,10 +312,12 @@ static int ext2_bmpt_get_path(struct ext2_bmpt_path *path, ext2_lblk_t iblk,
 		irec = path->ihdr.h_root;
 	}
 
+	/* now walk down the tree */
 	for (i = from_depth; i < path->ihdr.h_levels; i++) {
 		int level = path->ihdr.h_levels - i - 1;
 		struct dup_buf *dbuf;
 
+		/* Stop if we find holes during walking down the tree */
 		if (ext2_bmpt_irec_is_null(&irec))
 			break;
 
@@ -324,6 +331,7 @@ static int ext2_bmpt_get_path(struct ext2_bmpt_path *path, ext2_lblk_t iblk,
 			ret = -EIO;
 			goto cleanup;
 		}
+		/* Calculate the offset of the BMPT records at each level based on given @iblk */
 		path->dbufs[i] = dbuf;
 		path->recs[i] = (struct ext2_bmptrec *)path->dbufs[i]->data;
 		path->p[i] = ext2_bmpt_offsets(path->inode->i_sb, level, iblk);
@@ -353,6 +361,7 @@ cleanup:
 	return ret;
 }
 
+/* This routine fill a BMPT path from the highest BMPT node till the leaf */
 static int ext2_bmpt_fill_path(struct inode *inode, int run, ext2_lblk_t iblk,
 			       struct ext2_bmpt_path *path, int *null_depth)
 {
@@ -393,6 +402,9 @@ static void ext2_bmpt_free_all_path(struct ext2_bmpt_path *path)
 	memset(path, 0, sizeof(*path));
 }
 
+/*
+ * Recursive unmapper of BMPT tree
+ */
 static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 			       unsigned long start_iblk, unsigned long end_iblk)
 {
@@ -409,6 +421,8 @@ static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 		int delete_curr = 0;
 		struct ext2_bmptrec *rec = &path->recs[depth][path->p[depth]];
 
+		/* If we are not yet inside the range specified by @start_iblk and 
+		 * @end_iblk, or we meet a hole, skip... */
 		if (curr_iblk < start_iblk || curr_iblk > end_iblk ||
 		    ext2_bmpt_rec_is_null(rec))
 			continue;
@@ -420,6 +434,7 @@ static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 #endif
 
 		if (level) {
+			/* For non-leaf level, we get the path to the lowest level node possible first */
 			if (!path->dbufs[depth + 1]) {
 				int t;
 				err = ext2_bmpt_get_path(path, curr_iblk,
@@ -428,11 +443,13 @@ static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 					break;
 			}
 
+			/* We can recursively go down by one level */
 			err = ext2_bmpt_unmap_ind(path, level - 1, curr_iblk,
 						  curr_iblk + steps - 1);
 			if (err)
 				break;
 
+			/* If the children BMPT node becomes empty, we free it */
 			if (!ext2_bmpt_rec_counts(path->inode->i_sb,
 						  &path->ihdr,
 						  path->dbufs[depth + 1]))
@@ -442,6 +459,7 @@ static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 		}
 
 		if (delete_curr) {
+			/* The current BMPT records pointed should be freed */
 			struct ext2_bmptirec irec;
 			ext2_bmpt_rec2irec(rec, &irec);
 
@@ -462,6 +480,11 @@ static int ext2_bmpt_unmap_ind(struct ext2_bmpt_path *path, int level,
 	return err;
 }
 
+/*
+ * Increase the indirection by @numlevels_add for the BMPT tree
+ *
+ * Used for growing of BMPT tree
+ */
 static void ext2_bmpt_increase_indirection(struct ext2_bmpt_path *path,
 					   int numlevels_add, int growblks,
 					   struct ext2_bmptirec *irecs,
@@ -516,12 +539,14 @@ static void ext2_bmpt_unmap_blocks_internal(struct ext2_bmpt_path *path,
 		return;
 	}
 
+	/* Recursively walk the BMPT tree and free any blocks inside [@start_iblk, @end_iblk] */
 	err = ext2_bmpt_unmap_ind(path, path->ihdr.h_levels - 1, start_iblk,
 				  end_iblk);
 	if (err)
 		return;
 	if (!ext2_bmpt_rec_counts(path->inode->i_sb, &path->ihdr,
 				  path->dbufs[0])) {
+		/* In case the tree becomes empty, we reset the BMPT tree to height 0 as well */
 		struct ext2_bmptirec irec = path->ihdr.h_root;
 
 		ext2_bmpt_free_from_depth(path, 0, 1);
@@ -571,6 +596,9 @@ void ext2_bmpt_unmap_blocks(struct inode *inode, int run,
 	mutex_unlock(&ei->truncate_mutex);
 }
 
+/*
+ * Build a BMPT tree branch on given new BMPT node blocks allocated
+ */
 static void ext2_bmpt_setup_branch(struct ext2_bmpt_path *path,
 				   ext2_lblk_t iblk, int from_depth,
 				   struct ext2_bmptirec *irecs,
@@ -579,6 +607,8 @@ static void ext2_bmpt_setup_branch(struct ext2_bmpt_path *path,
 	int i;
 	int nindlvls = path->ihdr.h_levels - from_depth;
 
+	/* For each parent BMPT node, we calculate offset of the children
+	 * BMPT node based on @iblk, and insert a record pointing to children BMPT node */
 	for (i = 0; i < nindlvls; i++) {
 		int level = path->ihdr.h_levels - (from_depth + i) - 1;
 		struct ext2_bmptrec *recs =
@@ -725,6 +755,9 @@ failed_out:
 	return err;
 }
 
+/*
+ * BMAP operation for 0-height BMPT tree
+ */
 static int ext2_bmpt_linear_map_blocks(struct ext2_bmpt_path *path,
 				       struct ext2_bmpt_map_args *map,
 				       unsigned int flags)
@@ -807,29 +840,39 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	    (!EXT2_I(inode)->i_block_alloc_info))
 		ext2_init_block_alloc_info(inode);
 
+	/* Fill the path first */
 	ret = ext2_bmpt_fill_path(inode, run, map->iblk, &path, &null_depth);
 	if (ret)
 		return ret;
+	/* If the height of the tree is 0 and we want to look at I-node data block #0,
+	 * we call the linear BMAP routine */
 	if (!path.ihdr.h_levels && !map->iblk)
 		return ext2_bmpt_linear_map_blocks(&path, map, flags);
 	BUG_ON(null_depth > path.ihdr.h_levels);
 
 	if (!null_depth) {
+		/* If the tree is insufficient in height... */
 		if (!can_alloc) {
+			/* We can't allocate, so return a hole to the caller */
 			map->flags = 0;
 			map->len = 0;
 			ext2_bmpt_irec_clear(&map->irec);
 			return 0;
 		}
 
+		/* Calculate the number of blocks need to allocate till we get to the highest level BMPT node.
+		 * In case the tree is empty, we need to allocate 1 highest level BMPT node only. */
 		if (!ext2_bmpt_irec_is_null(&path.ihdr.h_root))
 			need_growblks = min_level - path.ihdr.h_levels;
 		else
 			need_growblks = 1;
+		/* We calculate how many blocks needed to get from the highest level BMPT node to the lowest level BMPT node */
 		need_indblks = min_level - 1;
 		nblks_allocate = need_growblks + need_indblks;
 		l0depth = min_level - 1;
 	} else {
+		/* We calculate how many indirections we need if null_depth tells we
+		 * meet holes in the middle when walking down the BMPT tree path */
 		if (null_depth != path.ihdr.h_levels) {
 			need_indblks = path.ihdr.h_levels - null_depth;
 			nblks_allocate = need_indblks;
@@ -840,6 +883,7 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	if (!can_alloc &&
 	    (need_indblks ||
 	     ext2_bmpt_rec_is_null(&path.recs[l0depth][path.p[l0depth]]))) {
+		/* Returns hole if we can't allocate, and we meet holes */
 		map->flags = 0;
 		map->len = 0;
 		ext2_bmpt_irec_clear(&map->irec);
@@ -848,6 +892,7 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	}
 
 	if (nblks_allocate) {
+		/* Allocate @nblks_allocate BMPT nodes */
 		int i;
 		struct ext2_bmptirec goal;
 		ssize_t pos = (null_depth) ? path.p[null_depth - 1] : 0;
@@ -867,6 +912,9 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 			goto cleanup;
 	} else if (!ext2_bmpt_rec_is_null(
 			   &path.recs[l0depth][path.p[l0depth]])) {
+		/* If we found that we don't need to insert branch or grow the BMPT tree,
+		 * and the BMPT records pointing to data block is ready, we just return such 
+		 * allocation */
 		unsigned long naddrs = EXT2_BMPT_ADDR_PER_BLOCK(inode->i_sb);
 		unsigned long boundary;
 		unsigned long p = path.p[l0depth];
@@ -895,7 +943,10 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 		goto get_mapping;
 	}
 
+	/* Now we allocate data blocks */
 	if (!(path.ihdr.h_flags & EXT2_BMPT_HDR_FLAGS_DUP)) {
+		/* For non-DUP-enabled BMPT tree, we simply allocate continuously.
+		 * For each data block there is no duplications */
 		ext2_fsblk_t goal;
 		ssize_t pos = path.p[l0depth];
 
@@ -907,6 +958,8 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 		if (ret)
 			goto cleanup;
 	} else {
+		/* For DUP-enabled BMPT tree, we allocate duplications according
+		 * to the amount specified in s_dupinode_dup_cnt in the superblock. */
 		int i;
 		struct ext2_bmptirec goal;
 		ssize_t pos = path.p[l0depth];
@@ -959,12 +1012,16 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 	}
 
 	if (need_indblks) {
+		/* We start to allocate branches */
 		int ind_parent = null_depth - 1;
 
 		BUG_ON(need_indblks != path.ihdr.h_levels - null_depth);
 
+		/* First set up the branches to the leaf BMPT node */
 		ext2_bmpt_setup_branch(&path, map->iblk, null_depth, irecsp,
 				       dbufsp);
+		/* After setting up, we install the pointer to the branch we just
+		 * set up at parent node above @null_depth */
 		dup_buf_lock(path.dbufs[ind_parent]);
 		dup_buf_start_write(path.dbufs[ind_parent]);
 		ext2_bmpt_irec2rec(irecsp,
@@ -990,6 +1047,7 @@ static int ext2_bmpt_map_blocks_locked(struct inode *inode, int run,
 		}
 	}
 
+	/* Now we fill the BMPT records pointing to data blocks in the leaf BMPT node */
 	dup_buf_lock(path.dbufs[l0depth]);
 	dup_buf_start_write(path.dbufs[l0depth]);
 	for (i = 0; i < numblks; i++) {

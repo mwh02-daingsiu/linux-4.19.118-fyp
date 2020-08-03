@@ -1049,6 +1049,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->s_desc_per_block_bits =
 		ilog2 (EXT2_DESC_PER_BLOCK(sb));
 	sbi->s_desc_per_block_bits = ilog2(EXT2_DESC_PER_BLOCK(sb));
+	/* Read in the s_dupinode_dup_cnt field from superblock on disk, if EXT2FYP is presented */
 	if (!EXT2_HAS_INCOMPAT_FEATURE(sb, EXT2_FEATURE_INCOMPAT_FYP))
 		sbi->s_dupinode_dup_cnt = 1;
 	else
@@ -1110,6 +1111,8 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 		ext2_msg(sb, KERN_ERR, "error: not enough memory");
 		goto failed_mount_group_desc;
 	}
+	/* We want to know which group has GDT as well, so that if we fail to read any blocks
+	 * in the main GDT we can lookup the backup GDT */
 	jul = 0;
 	for (iul = 1;
 	     iul < sbi->s_groups_count && jul < EXT2_MAX_GROUPS_HAS_SUPER;
@@ -1122,6 +1125,8 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 		block = descriptor_loc(sb, logic_sb_block, i);
 		sbi->s_group_desc[i] = sb_bread(sb, block);
 		if (!sbi->s_group_desc[i]) {
+			/* If we failed to read the main GDT block we resort to the
+			 * backup GDT blocks. */
 			for (jul = 1; jul < sbi->s_ngroups_has_super; jul++) {
 				unsigned long backup_sb =
 					ext2_group_first_block_no(

@@ -6,6 +6,7 @@
 
 static struct kmem_cache *dup_buf_kmem;
 
+/* dup_buf read routine, similar to bread() */
 struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 			     int nr_data_blocks)
 {
@@ -22,6 +23,7 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 
 	dbuf->nr_data_blocks = nr_data_blocks;
 	for (i = 0; i < nr_data_blocks; i++) {
+		/* This normally shouldn't fail, unless there is way too less memory */
 		struct buffer_head *bh = sb_getblk(sb, data_blocknrs[i]);
 		BUG_ON(!data_blocknrs[i]);
 		if (bh == NULL) {
@@ -36,8 +38,10 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 	for (i = 0; i < nr_data_blocks; i++)
 		lock_buffer(dbuf->bhs[i]);
 	for (i = 0; i < nr_data_blocks; i++) {
+		/* Try submit a read */
 		int err = bh_submit_read(dbuf->bhs[i]);
 		if (!err) {
+			/* If we succeed a read we immediately break out, no need to try other blocks */
 			dbuf->main_data_block = i;
 			break;
 		}
@@ -50,6 +54,8 @@ struct dup_buf *dup_buf_read(struct super_block *sb, sector_t *data_blocknrs,
 		goto out;
 	}
 
+	/* Use the success read copy to update the buffers of other copies, since they either are not read
+	 * as this read succeeded, or they failed */
 	for (i = 0; i < dbuf->main_data_block; i++) {
 		memcpy(dbuf->bhs[i]->b_data,
 		       dbuf->bhs[dbuf->main_data_block]->b_data,
@@ -74,6 +80,7 @@ enomem:
 	return NULL;
 }
 
+/* dup_buf get routine, similar to getblk() */
 struct dup_buf *dup_buf_get(struct super_block *sb, sector_t *data_blocknrs,
 			    int nr_data_blocks, int main_data_block)
 {
@@ -90,7 +97,9 @@ struct dup_buf *dup_buf_get(struct super_block *sb, sector_t *data_blocknrs,
 
 	dbuf->nr_data_blocks = nr_data_blocks;
 	for (i = 0; i < nr_data_blocks; i++) {
+		/* This normally won't fail */
 		struct buffer_head *bh = sb_getblk(sb, data_blocknrs[i]);
+		/* If someone attempts to use this infrastructure to read superblock area, panic */
 		BUG_ON(!data_blocknrs[i]);
 		if (bh == NULL) {
 			while (i--)
@@ -118,6 +127,7 @@ void dup_buf_finish_write(struct dup_buf *dbuf)
 {
 	int i;
 
+	/* Update the other copies */
 	for (i = 0; i < dbuf->nr_data_blocks; i++) {
 		struct buffer_head *bh = dbuf->bhs[i];
 
@@ -194,6 +204,7 @@ int dup_buf_sync(struct dup_buf *dbuf)
 	int i;
 	int eio = 0;
 
+	/* Sync all the copies to disk */
 	for (i = 0; i < dbuf->nr_data_blocks; i++) {
 		write_dirty_buffer(dbuf->bhs[i], REQ_SYNC);
 	}
